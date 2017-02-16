@@ -1,4 +1,5 @@
 import socket # Import socket module
+#import struct
 from threading import Thread
 
 MSGLEN = 1024
@@ -26,6 +27,14 @@ class Peer(Thread):
     def send_text(self, text):
 
         self.socket.send()
+
+
+   # def _send_text(self, socket, text):
+   #    
+   #     text = struct.chunk(len(text)) + text
+
+   #     socket.send_text(text)
+
 
 
 class Client:
