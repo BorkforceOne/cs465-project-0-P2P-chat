@@ -17,7 +17,6 @@ MSG_HEADER_LEN = 4
 MSG_BUFFER_SIZE = 2048
 
 peers = []
-client = None
 
 def safe_recv(socket, bytes_to_read):
     data = socket.recv(bytes_to_read)
@@ -94,7 +93,7 @@ class Peer(Thread):
                     print("[INFO] %s has connected" % self.name)
 
                     packet = struct.pack("<B", MSG_ACKNOWLEDGE_JOIN)
-                    packet += client.serialize()
+                    packet += serialize()
                     self.send(packet)
 
                 elif message_id == MSG_PEER_REQUEST:
@@ -130,8 +129,7 @@ class Peer(Thread):
 
                         peer = Peer(peer_socket, name, host, port)
 
-                        packet = struct.pack("<BI%dshI%ds" % (len(client.host), len(client.name)), MSG_JOIN_NETWORK,
-                                             len(client.host), client.host, client.port, len(client.name), client.name)
+                        packet = struct.pack("<BI%dshI%ds" % (len(my_hostname), len(my_name)), MSG_JOIN_NETWORK, len(my_hostname), my_hostname, my_port, len(my_name), my_name)
                         peer.send(packet)
 
                         print("[INFO] Connected to %s at %s:%d" % (name, host, port))
@@ -164,93 +162,86 @@ class Peer(Thread):
     def __str__(self):
         return "(%s:%d, %s)" % (self.host, self.port, self.name)
 
-class Client:
 
-    def __init__(self):
-        port = raw_input("Listen port: ")
-        if (port == ""):
-            port = 8080
-        else:
-            port = int(port)
+def interact():
+    while True:
+        command = raw_input("> ")
+        if command == '':
+            continue
+        command = command.split(' ')
 
-        name = raw_input("Enter your name: ")
+        if command[0] == 'connect':
+            # Do connection here
+            details = command[1].split(':')
+            host = details[0]
+            port = int(details[1])
 
-        self.uuid = uuid.uuid1()
-        self.listening_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.port = port
-        self.host = '127.0.0.1'
-        self.guid = self.uuid.int
-        self.name = name
-
-        listen_thread = Thread(None, self.listen)
-        interact_thread = Thread(None, self.interact)
-
-        interact_thread.start()
-        listen_thread.start()
-
-    def interact(self):
-        while True:
-            command = raw_input("> ")
-            if command == '':
-                continue
-            command = command.split(' ')
-
-            if command[0] == 'connect':
-                # Do connection here
-                details = command[1].split(':')
-                host = details[0]
-                port = int(details[1])
-
-                peer_socket = socket.socket()
-                peer_socket.connect((host, port))
-
-                peer = Peer(peer_socket)
-
-                peers.append(peer)
-                peer.start()
-
-                packet = struct.pack("<BI%dshI%ds" % (len(self.host), len(self.name)), MSG_JOIN_NETWORK, len(self.host), self.host, self.port, len(self.name), self.name)
-                peer.send(packet)
-
-                packet = struct.pack("<B", MSG_PEER_REQUEST)
-                peer.send(packet)
-
-            elif command[0] == 'say':
-                str = ' '.join(command[1:])
-                packet = struct.pack("<BI%ds" % len(str), MSG_CHAT_MESSAGE, len(str), str)
-                for peer in peers:
-                    peer.send(packet)
-                # Do chat message
-                print("[CHAT] %s says: %s" % (self.name, str))
-
-            elif command[0] == 'peers':
-                for peer in peers:
-                    print(peer)
-
-            elif command[0] == 'exit':
-                for peer in peers:
-                    peer.send_leave()
-                exit()
-
-    def listen(self):
-        print("[INFO] Listening for new peers on port " + str(self.port) + "...")
-
-        self.listening_socket.bind((self.host, self.port))
-        self.listening_socket.listen(5)
-
-        while True:
-            # accept connections from outside
-            (peer_socket, address) = self.listening_socket.accept()
-            # now do something with the clientsocket
-            # in this case, we'll pretend this is a threaded server
+            peer_socket = socket.socket()
+            peer_socket.connect((host, port))
 
             peer = Peer(peer_socket)
+
             peers.append(peer)
             peer.start()
 
-    def serialize(self):
-        return struct.pack("<I%dshI%ds" % (len(self.host), len(self.name)), len(self.host), self.host, self.port, len(self.name), self.name)
+            packet = struct.pack("<BI%dshI%ds" % (len(host), len(my_name)), MSG_JOIN_NETWORK, len(host), host, port, len(my_name), my_name)
+            peer.send(packet)
+
+            packet = struct.pack("<B", MSG_PEER_REQUEST)
+            peer.send(packet)
+
+        elif command[0] == 'say':
+            str = ' '.join(command[1:])
+            packet = struct.pack("<BI%ds" % len(str), MSG_CHAT_MESSAGE, len(str), str)
+            for peer in peers:
+                peer.send(packet)
+            # Do chat message
+            print("[CHAT] %s says: %s" % (my_name, str))
+
+        elif command[0] == 'peers':
+            for peer in peers:
+                print(peer)
+
+        elif command[0] == 'exit':
+            for peer in peers:
+                peer.send_leave()
+            exit()
+
+
+def listen():
+    print("[INFO] Listening for new peers on port " + str(my_port) + "...")
+
+    my_listening_socket.bind((my_hostname, my_port))
+    my_listening_socket.listen(5)
+
+    while True:
+        # accept connections from outside
+        (peer_socket, address) = my_listening_socket.accept()
+
+        peer = Peer(peer_socket)
+        peers.append(peer)
+        peer.start()
+
+
+def serialize():
+    return struct.pack("<I%dshI%ds" % (len(my_hostname), len(my_name)), len(my_hostname), my_hostname, my_port, len(my_name), my_name)
 
 print("====Super Awesome P2P Chat For Super Awesome People (SAP2PCFSAP for short)====")
 
-client = Client()
+my_hostname = '127.0.0.1'
+my_port = raw_input("Listen port: ")
+
+if my_port == "":
+    my_port = 8080
+else:
+    my_port = int(my_port)
+
+my_name = raw_input("Enter your name: ")
+
+my_listening_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+listen_thread = Thread(None, listen)
+interact_thread = Thread(None, interact)
+
+interact_thread.start()
+listen_thread.start()
