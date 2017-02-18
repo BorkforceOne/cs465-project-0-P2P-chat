@@ -1,7 +1,7 @@
 import socket
-import uuid
 import struct
-from threading import Thread
+import uuid
+from threading import Thread, Lock
 
 MSGLEN = 1024
 
@@ -12,34 +12,89 @@ MSG_CHAT_MESSAGE = 0X04
 MSG_PEER_REQUEST = 0X05
 MSG_PEER_LIST = 0X06
 MSG_ACKNOWLEDGE_JOIN = 0X07
+MSG_JOIN_CHAT = 0X08
+MSG_PEER_LIST_SYNC = 0X09
 
 MSG_HEADER_LEN = 4
 MSG_BUFFER_SIZE = 2048
 
-peers = []
+peers = {}
+peers_lock = Lock()
 
-def safe_recv(socket, bytes_to_read):
-    data = socket.recv(bytes_to_read)
+
+def add_peer(guid, hostname, port, name, instance=None, do_lock=True):
+    peer = {
+        'hostname': hostname,
+        'port': port,
+        'name': name,
+        'instance': instance
+    }
+
+    if do_lock:
+        peers_lock.acquire()
+
+    try:
+        peers[guid] = peer
+
+    finally:
+        if do_lock:
+            peers_lock.release()
+
+
+def safe_recv(sock, bytes_to_read):
+    data = sock.recv(bytes_to_read)
 
     if data == b'':
         raise RuntimeError("socket connection broken")
 
     return data
 
+
+def serialize_peers():
+    serialized_peers = ""
+
+    peers_lock.acquire()
+
+    try:
+        for guid in peers:
+            serialized_peers += serialize_peer(guid, False)
+
+    finally:
+        peers_lock.release()
+
+    return serialized_peers
+
+
+def serialize_peer(guid, do_lock=True):
+    if do_lock:
+        peers_lock.acquire()
+
+    try:
+        peer = peers[guid]
+        serialized_peer = struct.pack("<I%dsI%dsI%dsh" % (len(guid), len(peer['hostname']), len(peer['name'])),
+                                      len(guid), guid, len(peer['hostname']), peer['hostname'], len(peer['name']),
+                                      peer['name'], peer['port'])
+
+    finally:
+        if do_lock:
+            peers_lock.release()
+
+    return serialized_peer
+
+
 def unpack_helper(fmt, data):
     size = struct.calcsize(fmt)
     return struct.unpack(fmt, data[:size]), data[size:]
 
+
 class Peer(Thread):
 
-    def __init__(self, socket, name="", host="", port=-1):
+    def __init__(self, sock, guid=None, name=None):
         Thread.__init__(self)
-        print("[INFO] Peer connecting...")
 
+        self.sock = sock
+        self.guid = guid
         self.name = name
-        self.sock = socket
-        self.host = host
-        self.port = port
 
     def run(self):
         self.receive()
@@ -51,7 +106,8 @@ class Peer(Thread):
             try:
                 msg_len = safe_recv(self.sock, MSG_HEADER_LEN)
             except socket.error:
-                is_running = False
+                break
+            except RuntimeError:
                 break
 
             msg_len = struct.unpack('<I', msg_len)[0]
@@ -73,69 +129,111 @@ class Peer(Thread):
                 ((message_id,), data) = unpack_helper('<B', data)
 
                 if message_id == MSG_LEAVE:
-                    print("[CHAT] %s has left the chat", self.name)
-                    peers.remove(self)
+                    print("[CHAT] %s has left the chat" % self.name)
+                    peers_lock.acquire()
+
+                    try:
+                        del peers[self.guid]
+
+                    finally:
+                        peers_lock.release()
+
                     is_running = False
 
-                if message_id == MSG_CHAT_MESSAGE:
+                elif message_id == MSG_CHAT_MESSAGE:
                     # Read all data for this message
                     ((chat_len,), data) = unpack_helper('<I', data)
                     ((message,), data) = unpack_helper('<%ds' % chat_len, data)
                     print("[CHAT] %s says: %s" % (self.name, message))
 
                 elif message_id == MSG_JOIN_NETWORK:
-                    ((host_len,), data) = unpack_helper('<I', data)
-                    ((self.host,), data) = unpack_helper('<%ds' % host_len, data)
-                    ((self.port,), data) = unpack_helper('<h', data)
+                    ((guid_len,), data) = unpack_helper('<I', data)
+                    ((guid,), data) = unpack_helper('<%ds' % guid_len, data)
+                    ((hostname_len,), data) = unpack_helper('<I', data)
+                    ((hostname,), data) = unpack_helper('<%ds' % hostname_len, data)
                     ((name_len,), data) = unpack_helper('<I', data)
-                    ((self.name,), data) = unpack_helper('<%ds' % name_len, data)
+                    ((name,), data) = unpack_helper('<%ds' % name_len, data)
+                    ((port,), data) = unpack_helper('<h', data)
 
-                    print("[INFO] %s has connected" % self.name)
+                    self.guid = guid
+                    self.name = name
 
-                    packet = struct.pack("<B", MSG_ACKNOWLEDGE_JOIN)
-                    packet += serialize()
+                    add_peer(guid, hostname, port, name, self)
+
+                    print("[INFO] %s has connected" % name)
+
+                    packet = struct.pack("<BI%ds" % len(my_guid), MSG_ACKNOWLEDGE_JOIN, len(my_guid), my_guid)
                     self.send(packet)
 
+                elif message_id == MSG_JOIN_CHAT:
+                    ((guid_len,), data) = unpack_helper('<I', data)
+                    ((guid,), data) = unpack_helper('<%ds' % guid_len, data)
+                    ((hostname_len,), data) = unpack_helper('<I', data)
+                    ((hostname,), data) = unpack_helper('<%ds' % hostname_len, data)
+                    ((name_len,), data) = unpack_helper('<I', data)
+                    ((name,), data) = unpack_helper('<%ds' % name_len, data)
+                    ((port,), data) = unpack_helper('<h', data)
+
+                    self.guid = guid
+                    self.name = name
+
+                    add_peer(guid, hostname, port, name, self)
+
+                    print("[INFO] %s has connected" % name)
+
                 elif message_id == MSG_PEER_REQUEST:
-                    packet = struct.pack("<BI", MSG_PEER_LIST, len(peers) - 1)
-                    for peer in peers:
-                        if peer == self:
-                            continue
-                        packet += peer.serialize()
+                    packet = struct.pack("<BI", MSG_PEER_LIST, len(peers))
+                    packet += serialize_peers()
                     self.send(packet)
 
                 elif message_id == MSG_ACKNOWLEDGE_JOIN:
-                    ((host_len,), data) = unpack_helper('<I', data)
-                    ((self.host,), data) = unpack_helper('<%ds' % host_len, data)
-                    ((self.port,), data) = unpack_helper('<h', data)
-                    ((name_len,), data) = unpack_helper('<I', data)
-                    ((self.name,), data) = unpack_helper('<%ds' % name_len, data)
+                    ((guid_len,), data) = unpack_helper('<I', data)
+                    ((self.guid,), data) = unpack_helper('<%ds' % guid_len, data)
 
-                    print("[INFO] Connected to %s at %s:%d" % (self.name, self.host, self.port))
+                    # Request the peer list
+                    packet = struct.pack("<B", MSG_PEER_REQUEST)
+                    self.send(packet)
 
                 elif message_id == MSG_PEER_LIST:
-                    ((peers_len,), data) = unpack_helper('<I', data)
-                    for i in range(peers_len):
-                        # Connect to each peer identified
 
-                        ((host_len,), data) = unpack_helper('<I', data)
-                        ((host,), data) = unpack_helper('<%ds' % host_len, data)
-                        ((port,), data) = unpack_helper('<h', data)
-                        ((name_len,), data) = unpack_helper('<I', data)
-                        ((name,), data) = unpack_helper('<%ds' % name_len, data)
+                    peers_lock.acquire()
 
-                        peer_socket = socket.socket()
-                        peer_socket.connect((host, port))
+                    try:
+                        ((peers_len,), data) = unpack_helper('<I', data)
+                        for i in range(peers_len):
+                            # Connect to each peer identified
+                            ((guid_len,), data) = unpack_helper('<I', data)
+                            ((guid,), data) = unpack_helper('<%ds' % guid_len, data)
+                            ((hostname_len,), data) = unpack_helper('<I', data)
+                            ((hostname,), data) = unpack_helper('<%ds' % hostname_len, data)
+                            ((name_len,), data) = unpack_helper('<I', data)
+                            ((name,), data) = unpack_helper('<%ds' % name_len, data)
+                            ((port,), data) = unpack_helper('<h', data)
 
-                        peer = Peer(peer_socket, name, host, port)
+                            peer_instance = None
 
-                        packet = struct.pack("<BI%dshI%ds" % (len(my_hostname), len(my_name)), MSG_JOIN_NETWORK, len(my_hostname), my_hostname, my_port, len(my_name), my_name)
-                        peer.send(packet)
+                            if guid in peers:
+                                continue
+                            if guid == self.guid:
+                                peer_instance = self
+                                self.name = name
+                            else:
+                                peer_socket = socket.socket()
+                                peer_socket.connect((hostname, port))
 
-                        print("[INFO] Connected to %s at %s:%d" % (name, host, port))
+                                peer_instance = Peer(peer_socket, guid, name)
+                                peer_instance.start()
 
-                        peers.append(peer)
-                        peer.start()
+                                packet = struct.pack("<B", MSG_JOIN_CHAT)
+                                packet += serialize_peer(my_guid, False)
+                                peer_instance.send(packet)
+
+                            print("[INFO] Connected to %s at %s:%d" % (name, hostname, port))
+
+                            add_peer(guid, hostname, port, name, peer_instance, False)
+
+                    finally:
+                        peers_lock.release()
 
                 if data != "":
                     ((msg_len,), data) = unpack_helper('<I', data)
@@ -156,12 +254,6 @@ class Peer(Thread):
                 raise RuntimeError("socket connection broken")
             totalsent += sent
 
-    def serialize(self):
-        return struct.pack("<I%dshI%ds" % (len(self.host), len(self.name)), len(self.host), self.host, self.port, len(self.name), self.name)
-
-    def __str__(self):
-        return "(%s:%d, %s)" % (self.host, self.port, self.name)
-
 
 def interact():
     while True:
@@ -179,33 +271,58 @@ def interact():
             peer_socket = socket.socket()
             peer_socket.connect((host, port))
 
-            peer = Peer(peer_socket)
+            peer_instance = Peer(peer_socket)
 
-            peers.append(peer)
-            peer.start()
+            peer_instance.start()
 
-            packet = struct.pack("<BI%dshI%ds" % (len(host), len(my_name)), MSG_JOIN_NETWORK, len(host), host, port, len(my_name), my_name)
-            peer.send(packet)
+            # Tell them about ourselves
+            packet = struct.pack("<B", MSG_JOIN_NETWORK)
+            packet += serialize_peer(my_guid)
+            peer_instance.send(packet)
 
-            packet = struct.pack("<B", MSG_PEER_REQUEST)
-            peer.send(packet)
+            packet = struct.pack("<BI", MSG_PEER_LIST, len(peers))
+            packet += serialize_peers()
+            peer_instance.send(packet)
 
         elif command[0] == 'say':
-            str = ' '.join(command[1:])
-            packet = struct.pack("<BI%ds" % len(str), MSG_CHAT_MESSAGE, len(str), str)
-            for peer in peers:
-                peer.send(packet)
+            chat_message = ' '.join(command[1:])
+            packet = struct.pack("<BI%ds" % len(chat_message), MSG_CHAT_MESSAGE, len(chat_message), chat_message)
+
+            peers_lock.acquire()
+
+            try:
+                for guid in peers:
+                    peer = peers[guid]
+                    if peer['instance'] is not None:
+                        peer['instance'].send(packet)
+
+            finally:
+                peers_lock.release()
+
             # Do chat message
-            print("[CHAT] %s says: %s" % (my_name, str))
+            print("[CHAT] %s says: %s" % (my_name, chat_message))
 
         elif command[0] == 'peers':
-            for peer in peers:
-                print(peer)
+            for peer_instance in peers:
+                print(peer_instance)
 
         elif command[0] == 'exit':
-            for peer in peers:
-                peer.send_leave()
-            exit()
+            peers_lock.acquire()
+
+            try:
+                for guid in peers:
+                    peer = peers[guid]
+                    if peer['instance'] is None:
+                        continue
+
+                    peer['instance'].send_leave()
+                    peer['instance'].exit()
+
+            finally:
+                peers_lock.release()
+
+            break
+
 
 
 def listen():
@@ -219,15 +336,11 @@ def listen():
         (peer_socket, address) = my_listening_socket.accept()
 
         peer = Peer(peer_socket)
-        peers.append(peer)
         peer.start()
-
-
-def serialize():
-    return struct.pack("<I%dshI%ds" % (len(my_hostname), len(my_name)), len(my_hostname), my_hostname, my_port, len(my_name), my_name)
 
 print("====Super Awesome P2P Chat For Super Awesome People (SAP2PCFSAP for short)====")
 
+my_guid = str(uuid.uuid1())
 my_hostname = '127.0.0.1'
 my_port = raw_input("Listen port: ")
 
@@ -237,6 +350,8 @@ else:
     my_port = int(my_port)
 
 my_name = raw_input("Enter your name: ")
+
+add_peer(my_guid, my_hostname, my_port, my_name)
 
 my_listening_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
