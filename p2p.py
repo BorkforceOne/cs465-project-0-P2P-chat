@@ -52,17 +52,19 @@ def safe_recv(sock, bytes_to_read):
     return data
 
 
-def serialize_peers():
+def serialize_peers(do_lock=True):
     serialized_peers = ""
 
-    peers_lock.acquire()
+    if do_lock:
+        peers_lock.acquire()
 
     try:
         for guid in peers:
             serialized_peers += serialize_peer(guid, False)
 
     finally:
-        peers_lock.release()
+        if do_lock:
+            peers_lock.release()
 
     return serialized_peers
 
@@ -337,6 +339,9 @@ def interact():
         command = command.split(' ')
 
         if command[0] == 'connect':
+
+            peers_lock.acquire()
+
             # Do connection here
             details = command[1].split(':')
             host = details[0]
@@ -351,12 +356,14 @@ def interact():
 
             # Tell them about ourselves
             packet = struct.pack("<B", MSG_JOIN_NETWORK)
-            packet += serialize_peer(my_guid)
+            packet += serialize_peer(my_guid, False)
             peer_instance.send(packet)
 
             packet = struct.pack("<BI", MSG_PEER_LIST, len(peers))
-            packet += serialize_peers()
+            packet += serialize_peers(False)
             peer_instance.send(packet)
+
+            peers_lock.release()
 
         elif command[0] == 'say':
             chat_message = ' '.join(command[1:])
