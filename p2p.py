@@ -1,7 +1,9 @@
 import socket
 import struct
 import uuid
-from threading import Thread, Lock
+import errno
+import time
+from threading import Thread, Lock, Event
 
 MSGLEN = 1024
 
@@ -87,43 +89,83 @@ def unpack_helper(fmt, data):
     return struct.unpack(fmt, data[:size]), data[size:]
 
 
-class Peer(Thread):
+class StoppableThread(Thread):
+    def __init__(self):
+        Thread.__init__(self)
+        self.stop_event = Event()
+
+    def stop(self):
+        if self.isAlive():
+            # set event to signal thread to terminate
+            self.stop_event.set()
+            # block calling thread until thread really has terminated
+            self.join()
+
+
+class Peer(StoppableThread):
 
     def __init__(self, sock, guid=None, name=None):
-        Thread.__init__(self)
+        StoppableThread.__init__(self)
 
         self.sock = sock
         self.guid = guid
         self.name = name
 
-    def run(self):
-        self.receive()
+        self.sock.setblocking(False)
 
-    def receive(self):
-        is_running = True
-        while is_running:
+    def run(self):
+        while self.stop_event.is_set() == False:
             data = ''
-            try:
-                msg_len = safe_recv(self.sock, MSG_HEADER_LEN)
-            except socket.error:
-                break
-            except RuntimeError:
-                break
+            msg_len = 0
+            while self.stop_event.is_set() == False:
+                try:
+                    msg_len = safe_recv(self.sock, MSG_HEADER_LEN)
+                    break
+                except socket.error as (sock_errno, sock_errstr):
+                    if sock_errno == errno.EWOULDBLOCK:
+                        # socket would block - sleep sometime
+                        time.sleep(0.1)
+                    else:
+                        self.stop_event.set()
+                        break
+                except:
+                    self.stop_event.set()
+                    break
+
+            if self.stop_event.is_set():
+                continue
 
             msg_len = struct.unpack('<I', msg_len)[0]
 
             read_len = 0
             while read_len < msg_len:
-                try:
-                    chunk = safe_recv(self.sock, MSG_BUFFER_SIZE)
-                except socket.error:
-                    is_running = False
+                chunk = None
+
+                while self.stop_event.is_set() == False:
+                    try:
+                        chunk = safe_recv(self.sock, MSG_BUFFER_SIZE)
+                        break
+                    except socket.error as (sock_errno, sock_errstr):
+                        if sock_errno == errno.EWOULDBLOCK:
+                            # socket would block - sleep sometime
+                            time.sleep(0.1)
+                        else:
+                            self.stop_event.set()
+                            break
+                    except:
+                        self.stop_event.set()
+                        break
+
+                if self.stop_event.is_set():
                     break
 
                 if not chunk:
                     break
                 data += chunk
                 read_len += len(chunk)
+
+            if self.stop_event.is_set():
+                continue
 
             while data != "":
                 ((message_id,), data) = unpack_helper('<B', data)
@@ -137,8 +179,6 @@ class Peer(Thread):
 
                     finally:
                         peers_lock.release()
-
-                    is_running = False
 
                 elif message_id == MSG_CHAT_MESSAGE:
                     # Read all data for this message
@@ -243,7 +283,7 @@ class Peer(Thread):
     def send_leave(self):
         packet = struct.pack("<B", MSG_LEAVE)
         self.send(packet)
-        self.sock.close()
+        self.stop_event.is_set()
 
     def send(self, packed):
         packed = struct.pack('<I', len(packed)) + packed
@@ -253,6 +293,40 @@ class Peer(Thread):
             if sent == 0:
                 raise RuntimeError("socket connection broken")
             totalsent += sent
+
+class Listen(StoppableThread):
+    def __init__(self, hostname, port):
+        StoppableThread.__init__(self)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.hostname = hostname
+        self.port = port
+
+    def run(self):
+        print("[INFO] Listening for new peers on port " + str(my_port) + "...")
+
+        self.sock.bind(('', my_port))
+        self.sock.listen(5)
+        self.sock.settimeout(0.01)
+
+        while self.stop_event.is_set() == False:
+            try:
+                (peer_socket, address) = self.sock.accept()
+                peer = Peer(peer_socket)
+                peer.start()
+            except socket.timeout:
+                if self.stop_event.isSet():
+                    removed = []
+                    peers_lock.acquire()
+
+                    for guid, peer in peers.iteritems():
+                        if peer['instance'] is not None:
+                            peer['instance'].stop()
+                            removed.append(guid)
+
+                    for guid in removed:
+                        del peers[guid]
+
+                    peers_lock.release()
 
 
 def interact():
@@ -316,27 +390,14 @@ def interact():
                         continue
 
                     peer['instance'].send_leave()
-                    peer['instance'].exit()
+                    peer['instance'].stop()
 
             finally:
                 peers_lock.release()
 
+            listen_thread.stop()
+
             break
-
-
-
-def listen():
-    print("[INFO] Listening for new peers on port " + str(my_port) + "...")
-
-    my_listening_socket.bind((my_hostname, my_port))
-    my_listening_socket.listen(5)
-
-    while True:
-        # accept connections from outside
-        (peer_socket, address) = my_listening_socket.accept()
-
-        peer = Peer(peer_socket)
-        peer.start()
 
 print("====Super Awesome P2P Chat For Super Awesome People (SAP2PCFSAP for short)====")
 
@@ -353,10 +414,9 @@ my_name = raw_input("Enter your name: ")
 
 add_peer(my_guid, my_hostname, my_port, my_name)
 
-my_listening_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-listen_thread = Thread(None, listen)
-interact_thread = Thread(None, interact)
-
-interact_thread.start()
+listen_thread = Listen(my_hostname, my_port)
 listen_thread.start()
+
+interact()
+
+print("Exiting...")
