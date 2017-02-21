@@ -409,7 +409,7 @@ def interact():
 print("====Super Awesome P2P Chat For Super Awesome People (SAP2PCFSAP for short)====")
 
 my_guid = str(uuid.uuid1())
-my_hostname = '127.0.0.1'
+my_hostname = raw_input("Listen IP address: ")
 my_port = raw_input("Listen port: ")
 
 if my_port == "":
